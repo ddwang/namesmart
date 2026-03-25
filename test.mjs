@@ -10,7 +10,7 @@ const { values } = parseArgs({
   options: {
     name: { type: "string", default: "Assistant" },
     n: { type: "string", default: "10" },
-    model: { type: "string", default: "claude-sonnet-4-5-20250929" },
+    model: { type: "string", default: "claude-haiku-4-5-20251001" },
     verbose: { type: "boolean", default: false },
   },
 });
