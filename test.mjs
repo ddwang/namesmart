@@ -12,6 +12,8 @@ const { values } = parseArgs({
     n: { type: "string", default: "10" },
     model: { type: "string", default: "claude-haiku-4-5-20251001" },
     verbose: { type: "boolean", default: false },
+    thinking: { type: "boolean", default: false },
+    concurrency: { type: "string", default: "10" },
   },
 });
 
@@ -19,8 +21,11 @@ const name = values.name;
 const n = parseInt(values.n, 10);
 const modelId = values.model;
 const verbose = values.verbose;
+const thinking = values.thinking;
+const concurrency = parseInt(values.concurrency, 10);
 
 const anthropic = createAnthropic();
+const openai = createOpenAI();
 const baseten = createOpenAI({
   apiKey: process.env.BASETEN_API_KEY,
   baseURL: "https://inference.baseten.co/v1",
@@ -29,6 +34,9 @@ const baseten = createOpenAI({
 function getModel(id) {
   if (id.includes("/")) {
     return baseten.chat(id);
+  }
+  if (id.startsWith("gpt") || id.startsWith("o1") || id.startsWith("o3") || id.startsWith("o4")) {
+    return openai.chat(id);
   }
   return anthropic(id);
 }
@@ -105,31 +113,79 @@ console.log(
 
 let correct = 0;
 let totalOutputTokens = 0;
+let completed = 0;
 const startTime = Date.now();
 
-for (let i = 0; i < n; i++) {
-  const q = generateQuestion();
+// Pre-generate all questions
+const questions = Array.from({ length: n }, () => generateQuestion());
+const results = new Array(n);
 
-  const { text, usage } = await generateText({
-    model: getModel(modelId),
-    system: `You are ${name}, a chatbot.`,
-    prompt: q.prompt,
-  });
+const isAnthropic = !modelId.includes("/") && !modelId.startsWith("gpt") && !modelId.startsWith("o1") && !modelId.startsWith("o3") && !modelId.startsWith("o4");
+const providerOptions = {};
+if (isAnthropic) {
+  providerOptions.anthropic = {
+    thinking: { type: thinking ? "enabled" : "disabled", ...(thinking && { budgetTokens: 10000 }) },
+  };
+}
 
-  const llmAnswer = extractAnswer(text, q.answer);
-  const isCorrect = llmAnswer === q.answer;
-  if (isCorrect) correct++;
-  if (usage?.outputTokens) totalOutputTokens += usage.outputTokens;
+async function runQuestion(i, retries = 5) {
+  const q = questions[i];
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const { text, usage } = await generateText({
+        model: getModel(modelId),
+        system: `You are ${name}, a chatbot.`,
+        prompt: q.prompt,
+        providerOptions,
+        maxRetries: 1,
+      });
+      const llmAnswer = extractAnswer(text, q.answer);
+      const isCorrect = llmAnswer === q.answer;
+      results[i] = { q, llmAnswer, isCorrect, tokens: usage?.outputTokens ?? 0 };
 
-  const mark = isCorrect ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
-  if (verbose) {
+      if (isCorrect) correct++;
+      totalOutputTokens += results[i].tokens;
+      completed++;
+      const mark = isCorrect ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
+      if (!verbose) {
+        process.stdout.write(mark);
+        if (completed % 50 === 0) process.stdout.write("\n");
+      }
+      return;
+    } catch (e) {
+      if (e.statusCode === 429 || e.lastError?.statusCode === 429) {
+        const wait = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
+        await new Promise((r) => setTimeout(r, wait));
+        continue;
+      }
+      throw e;
+    }
+  }
+  // All retries exhausted — mark as wrong
+  results[i] = { q: questions[i], llmAnswer: "ERROR", isCorrect: false, tokens: 0 };
+  completed++;
+  if (!verbose) process.stdout.write("\x1b[33m?\x1b[0m");
+}
+
+// Run with concurrency limit
+const queue = Array.from({ length: n }, (_, i) => i);
+async function worker() {
+  while (queue.length > 0) {
+    const i = queue.shift();
+    await runQuestion(i);
+  }
+}
+await Promise.all(Array.from({ length: Math.min(concurrency, n) }, () => worker()));
+
+// Print verbose output in order after all complete
+if (verbose) {
+  for (let i = 0; i < n; i++) {
+    const { q, llmAnswer, isCorrect } = results[i];
+    const mark = isCorrect ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
     const num = String(i + 1).padStart(2);
     console.log(
       ` #${num}  ${q.display} = ${q.answer} | LLM: ${llmAnswer} | ${mark}`
     );
-  } else {
-    process.stdout.write(mark);
-    if ((i + 1) % 50 === 0) process.stdout.write("\n");
   }
 }
 
